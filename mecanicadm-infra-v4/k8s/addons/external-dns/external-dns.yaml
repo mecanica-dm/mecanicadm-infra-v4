@@ -1,0 +1,94 @@
+# ExternalDNS v0.15.0
+# Fonte: https://github.com/kubernetes-sigs/external-dns/tree/v0.15.0/kustomize
+#
+# Mantem o Route 53 sincronizado com Services do tipo LoadBalancer (Kong) e
+# Ingresses. A autenticacao na AWS e feita via IRSA: o ServiceAccount
+# "external-dns" e criado pelo Terraform com a anotacao eks.amazonaws.com/role-arn.
+#
+# Ajustes locais em relacao ao kustomize upstream:
+#   - Namespace "external-dns" explicito (o namespace e criado pelo Terraform).
+#   - Argumentos fixados para o cenario do projeto (provider aws, policy
+#     upsert-only, dominio e owner id do cluster).
+#   - Requests/limits para caber nos nodes t3.small.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+  labels:
+    app.kubernetes.io/name: external-dns
+    app.kubernetes.io/part-of: mecanicadm
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints", "pods", "services"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["extensions"]
+    resources: ["ingresses"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns-viewer
+  labels:
+    app.kubernetes.io/name: external-dns
+    app.kubernetes.io/part-of: mecanicadm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: external-dns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: external-dns
+  labels:
+    app.kubernetes.io/name: external-dns
+    app.kubernetes.io/part-of: mecanicadm
+spec:
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: external-dns
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: external-dns
+        app.kubernetes.io/part-of: mecanicadm
+    spec:
+      serviceAccountName: external-dns
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.15.0
+          args:
+            - --source=service
+            - --source=ingress
+            - --registry=txt
+            - --provider=aws
+            - --policy=upsert-only
+            - --txt-owner-id=mecanicadm-prod
+            - --domain-filter=mecanicadm.com.br
+            - --service-type-filter=LoadBalancer
+            - --aws-zone-type=public
+            - --interval=1m
+            - --log-level=info
+            - --log-format=text
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

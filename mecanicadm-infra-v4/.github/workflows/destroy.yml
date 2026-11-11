@@ -1,0 +1,70 @@
+name: DESTROY - Infraestrutura K8s (botão vermelho)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Digite DESTRUIR para confirmar"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    environment: prod
+    timeout-minutes: 60
+
+    if: inputs.confirmation == 'DESTRUIR'
+
+    env:
+      TF_WORKSPACE: prod
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configura credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup do Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="key=terraform/mecanicadm-k8s/terraform.tfstate"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      # A deleção mais demorada é a do cluster (~10 min) e do NLB do Kong
+      # (que só some de verdade quando o load balancer é desprovisionado).
+      - name: Verifica órfãos (informativo)
+        if: always()
+        run: |
+          echo "=== Load Balancers restantes ==="
+          aws elbv2 describe-load-balancers \
+            --query 'LoadBalancers[].LoadBalancerName' \
+            --output table 2>/dev/null || true
+          echo "=== IPs Elásticos SEM anexo ==="
+          aws ec2 describe-addresses \
+            --query 'Addresses[?!AssociationId].PublicIp' \
+            --output table 2>/dev/null || true
+          echo "=== NAT Gateways ativos ==="
+          aws ec2 describe-nat-gateways \
+            --filters Name=state,Values=available,pending \
+            --query 'NatGateways[].NatGatewayId' \
+            --output table 2>/dev/null || true
+          echo ">>> Se aparecer algo acima, apague manualmente pelo console."
