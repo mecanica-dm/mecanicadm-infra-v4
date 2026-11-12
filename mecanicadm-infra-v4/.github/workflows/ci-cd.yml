@@ -6,20 +6,28 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Compartilhado com o destroy.yml: nunca apply e destroy ao mesmo tempo.
+  group: infra-prod
   cancel-in-progress: false
 
 env:
   AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'mecanicadm-v4-01' }}
+  TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'terraform/mecanicadm-v4/terraform.tfstate' }}
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_cluster_name: ${{ vars.EKS_CLUSTER_NAME || 'mecanicadm-prod' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
 
 jobs:
   terraform:
     runs-on: ubuntu-latest
     environment: prod
-
-    env:
-      TF_WORKSPACE: prod
+    timeout-minutes: 60
 
     steps:
       - name: Checkout do código
@@ -35,23 +43,33 @@ jobs:
       - name: Setup do Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.8.0"
+          terraform_version: "1.15.4"
 
-      - name: Ensure S3 backend exists
+      - name: Garante o bucket do backend S3
         run: |
-          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
-          BUCKET="${{ vars.TF_STATE_BUCKET }}"
-          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            if [ "$REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+          if [ -z "$TF_STATE_BUCKET" ]; then
+            echo "::error::TF_STATE_BUCKET não definido (repo variable ou default do workflow)."
+            exit 1
+          fi
+
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            # PR não cria infraestrutura de produção: só valida.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "::error::Bucket $TF_STATE_BUCKET não existe. Rode o workflow na main para criá-lo."
+              exit 1
+            fi
+
+            if [ "$AWS_DEFAULT_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" --region "$AWS_DEFAULT_REGION"
             else
-              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
-                --create-bucket-configuration LocationConstraint="$REGION"
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" --region "$AWS_DEFAULT_REGION" \
+                --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
             fi
           fi
-          aws s3api put-bucket-versioning --bucket "$BUCKET" \
+
+          aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
             --versioning-configuration Status=Enabled
-          aws s3api put-bucket-encryption --bucket "$BUCKET" \
+          aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
             --server-side-encryption-configuration '{
               "Rules": [{
                 "ApplyServerSideEncryptionByDefault": {
@@ -64,33 +82,49 @@ jobs:
       - name: Terraform Init
         run: |
           terraform init \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
-            -backend-config="key=terraform/mecanicadm-k8s/terraform.tfstate"
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_DEFAULT_REGION}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="use_lockfile=true"
 
       - name: Terraform Format
-        run: terraform fmt -check -diff
+        run: terraform fmt -check -recursive -diff
 
       - name: Terraform Validate
-        run: terraform validate
+        run: terraform validate -no-color
+
+      # O provider kubernetes depende do cluster EKS existir para ser configurado
+      # (providers.tf usa module.eks.cluster_endpoint + aws_eks_cluster_auth).
+      # Em um ambiente do zero o plan falharia; por isso criamos VPC + EKS
+      # primeiro com -target e só depois planejamos o restante.
+      - name: Bootstrap do cluster (primeira execução)
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        run: |
+          if aws eks describe-cluster --name "$TF_VAR_cluster_name" --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1; then
+            echo "Cluster $TF_VAR_cluster_name já existe; seguindo para o plan."
+            exit 0
+          fi
+
+          echo "Cluster não encontrado: criando VPC + EKS primeiro (target=module.eks)."
+          terraform apply -auto-approve -input=false -target=module.eks
 
       - name: Terraform Plan
-        run: terraform plan -out=tfplan-prod
+        run: terraform plan -input=false -no-color -out=tfplan-prod
 
       - name: Terraform Apply
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve tfplan-prod
+        run: terraform apply -auto-approve -input=false tfplan-prod
 
       - name: Terraform Outputs
-        if: github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         run: terraform output
 
       - name: Atualiza o kubeconfig do EKS
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         run: |
-          aws eks update-kubeconfig \
-            --name ${{ vars.EKS_CLUSTER_NAME || 'mecanicadm-prod' }} \
-            --region ${{ vars.AWS_REGION || 'us-east-1' }}
+          CLUSTER_NAME="$(terraform output -raw cluster_name)"
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
 
       - name: Aplica os manifests dos add-ons
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
@@ -103,6 +137,40 @@ jobs:
 
           kubectl apply -f k8s/addons/kong/kong.yaml
 
+      # A stack de observabilidade precisa da license key do New Relic. Sem o
+      # secret a pipeline segue (com warning) em vez de falhar a infra inteira.
+      - name: Verifica se a observabilidade está habilitada
+        id: observability
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        env:
+          NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+        run: |
+          if [ "$(terraform output -raw observability_enabled)" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::observability_enabled=false; stack de observabilidade será ignorada."
+          elif [ -z "$NEW_RELIC_LICENSE_KEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Secret NEW_RELIC_LICENSE_KEY ausente; stack de observabilidade será ignorada."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Aplica a stack de observabilidade
+        if: steps.observability.outputs.enabled == 'true'
+        env:
+          NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+        run: |
+          # O secret é a única fonte da license key: os manifests só a consomem
+          # via secretKeyRef / credentials_file, nunca ficam com ela em texto puro.
+          kubectl create secret generic newrelic-license-key \
+            -n observability \
+            --from-literal=license-key="${NEW_RELIC_LICENSE_KEY}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl apply -f k8s/addons/observability/kube-state-metrics.yaml
+          kubectl apply -f k8s/addons/observability/prometheus-agent.yaml
+          kubectl apply -f k8s/addons/observability/otel-collector.yaml
+
       - name: Aguarda os add-ons ficarem prontos
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         run: |
@@ -113,6 +181,13 @@ jobs:
           if [ "$(terraform output -raw external_dns_enabled)" = "true" ]; then
             kubectl -n external-dns rollout status deployment/external-dns --timeout=5m
           fi
+
+      - name: Aguarda a stack de observabilidade ficar pronta
+        if: steps.observability.outputs.enabled == 'true'
+        run: |
+          kubectl -n observability rollout status deployment/kube-state-metrics --timeout=5m
+          kubectl -n observability rollout status deployment/prometheus-agent --timeout=5m
+          kubectl -n observability rollout status daemonset/otel-collector --timeout=5m
 
       - name: Verifica a injeção do IRSA no ExternalDNS
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'

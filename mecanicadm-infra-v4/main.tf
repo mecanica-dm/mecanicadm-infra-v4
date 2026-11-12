@@ -90,10 +90,11 @@ module "eks" {
 }
 
 # ---------------------------------------------------------------------------
-# Namespaces — criados pelo Terraform e usados pelos manifests em k8s/.
+# Namespaces — criados pelo Terraform e usados pelos add-ons em k8s/addons/.
 # ---------------------------------------------------------------------------
 
-# Namespace de negócio — onde a API principal é aplicada (k8s/app).
+# Namespace de negócio — onde a API principal é aplicada pelo pipeline do
+# repositório da aplicação (os manifests não vivem mais neste repo).
 resource "kubernetes_namespace_v1" "mecanicadm" {
   metadata {
     name = "mecanicadm"
@@ -129,18 +130,39 @@ resource "kubernetes_namespace_v1" "external_dns" {
   depends_on = [module.eks]
 }
 
+# Namespace da stack de observabilidade (OTel Collector, kube-state-metrics e
+# Prometheus Agent). Os manifests ficam em k8s/addons/observability/.
+resource "kubernetes_namespace_v1" "observability" {
+  count = var.observability_enabled ? 1 : 0
+
+  metadata {
+    name = "observability"
+    labels = {
+      environment = var.environment
+    }
+  }
+
+  depends_on = [module.eks]
+}
+
 # ---------------------------------------------------------------------------
 # Add-ons de terceiros.
 #
 # A instalação é feita com manifests Kubernetes puros, versionados em
 # k8s/addons/, aplicados pela pipeline com `kubectl apply`:
-#   - k8s/addons/kong/kong.yaml                    (Kong Gateway + Ingress Controller)
-#   - k8s/addons/metrics-server/components.yaml    (metrics-server, usado pelo HPA)
-#   - k8s/addons/external-dns/...                  (ExternalDNS + Route 53)
+#   - k8s/addons/kong/kong.yaml                          (Kong Gateway + Ingress Controller)
+#   - k8s/addons/metrics-server/components.yaml          (metrics-server, usado pelo HPA)
+#   - k8s/addons/external-dns/...                        (ExternalDNS + Route 53)
+#   - k8s/addons/observability/kube-state-metrics.yaml   (estado dos objetos do cluster)
+#   - k8s/addons/observability/prometheus-agent.yaml     (remote_write para o New Relic)
+#   - k8s/addons/observability/otel-collector.yaml       (métricas de node/pod + eventos)
 #
 # O Terraform permanece responsável pela infraestrutura AWS, pelos namespaces e
 # pelos ServiceAccounts com IRSA (anotações eks.amazonaws.com/role-arn), que são
 # pré-requisitos dos manifests acima.
+#
+# External Secrets Operator não é utilizado neste projeto: os secrets da
+# aplicação são gerenciados pelo pipeline do repositório da app.
 # ---------------------------------------------------------------------------
 
 # API Gateway (Kong) — expõe a API via LoadBalancer (NLB), cujo hostname é
@@ -159,10 +181,15 @@ resource "kubernetes_service_account_v1" "kong" {
   depends_on = [kubernetes_namespace_v1.kong]
 }
 
-# Observabilidade — o monitoramento é feito pelo New Relic (APM via Java agent
-# no microserviço). O antigo nri-bundle (integração de cluster) foi removido
-# junto com o Helm: não há distribuição oficial do chart em YAML puro e o APM
-# já cobre a aplicação.
+# Observabilidade — o APM da aplicação continua sendo feito pelo New Relic via
+# Java agent (configurado no repositório da app). A visão de cluster, que antes
+# vinha do nri-bundle (Helm), é reconstruída sem Helm por três peças em
+# k8s/addons/observability/:
+#   - kube-state-metrics  : estado dos objetos (Deployments, Pods, HPA, Nodes)
+#   - prometheus-agent    : scrape do kube-state-metrics -> remote_write New Relic
+#   - otel-collector      : kubeletstats + k8s_cluster + k8s_events -> OTLP New Relic
+# Todos autenticam com a license key do secret "newrelic-license-key", criado
+# pela pipeline a partir do GitHub secret NEW_RELIC_LICENSE_KEY.
 
 # metrics-server — necessário para o HorizontalPodAutoscaler (hpa.yaml) escalar
 # por CPU/memória. Instalado pelo manifest k8s/addons/metrics-server.

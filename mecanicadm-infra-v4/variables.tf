@@ -67,3 +67,9 @@ variable "external_dns_enabled" {
   type        = bool
   default     = true
 }
+
+variable "observability_enabled" {
+  description = "Habilita a stack de observabilidade no namespace observability (OTel Collector + kube-state-metrics + Prometheus Agent). Requer o secret NEW_RELIC_LICENSE_KEY na pipeline."
+  type        = bool
+  default     = true
+}

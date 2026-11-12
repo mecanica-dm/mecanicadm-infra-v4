@@ -2,7 +2,8 @@
 # ambiente (os ciclos de destroy/recreate dependem dela para o DNS se
 # reconstituir sozinho via ExternalDNS).
 terraform {
-  required_version = ">= 1.5.0"
+  # >= 1.10 para suportar state locking nativo do backend S3 (use_lockfile).
+  required_version = ">= 1.10.0"
 
   required_providers {
     aws = {

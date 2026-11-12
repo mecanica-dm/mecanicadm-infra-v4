@@ -22,3 +22,8 @@ output "external_dns_irsa_role_arn" {
   description = "ARN da IAM Role usada pelo ServiceAccount do ExternalDNS."
   value       = var.external_dns_enabled ? aws_iam_role.external_dns[0].arn : ""
 }
+
+output "observability_enabled" {
+  description = "Indica se a stack de observabilidade está habilitada (a pipeline usa para decidir se aplica os manifests)."
+  value       = var.observability_enabled
+}
