@@ -1,0 +1,315 @@
+# OpenTelemetry Collector Contrib 0.165.0
+# Fonte: https://github.com/open-telemetry/opentelemetry-collector-contrib
+#
+# Substitui o antigo nri-bundle (removido junto com o Helm) para a parte de
+# metricas de Kubernetes, usando o caminho nativo OTLP do New Relic.
+#
+# O que este DaemonSet envia:
+#   - kubeletstats : CPU/memoria/rede/filesystem por node, pod e container
+#   - k8s_cluster  : estado do cluster (nodes Ready, pods por fase, etc.)
+#   - k8s_events   : eventos do cluster (OOMKilled, FailedScheduling, ...)
+#
+# kubeletstats roda em todos os nodes (cada um le o proprio kubelet). Ja
+# k8s_cluster e k8s_events usam o extension k8s_leader_elector: apenas o pod
+# lider coleta, evitando series/eventos duplicados vindos de cada node.
+#
+# O estado dos objetos (Deployments, HPA, replicas) NAO vem daqui: vem do
+# kube-state-metrics via Prometheus remote_write (prometheus-agent.yaml).
+#
+# Autenticacao: header "api-key" com a license key do New Relic, lida do secret
+# "newrelic-license-key" (key: license-key). O secret e criado pela pipeline a
+# partir do GitHub secret NEW_RELIC_LICENSE_KEY.
+#
+# Conta EU ou JP? Troque o endpoint do exporter para:
+#   EU: https://otlp.eu01.nr-data.net:4318
+#   JP: https://otlp.jp.nr-data.net:4318
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+---
+# Permissoes de leitura necessarias para kubeletstats (nodes/stats), k8s_cluster,
+# k8s_events e para o k8sattributes enriquecer os dados com namespace/deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/stats
+      - nodes/proxy
+      - pods
+      - namespaces
+      - services
+      - endpoints
+      - events
+      - replicationcontrollers
+      - resourcequotas
+      - persistentvolumeclaims
+      - persistentvolumes
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability
+---
+# Permissoes do lease de leader election (k8s_cluster/k8s_events).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: otel-collector-lease
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: otel-collector-lease
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: otel-collector-lease
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+data:
+  config.yaml: |
+    extensions:
+      # k8s_cluster e k8s_events sao escopo de cluster: sem leader election cada
+      # pod do DaemonSet enviaria os mesmos dados (duplicados) ao New Relic.
+      # Apenas o lider do lease coleta; kubeletstats continua por node.
+      k8s_leader_elector:
+        auth_type: serviceAccount
+        lease_name: otel-collector-cluster
+        lease_namespace: observability
+
+    receivers:
+      # Metricas do kubelet do proprio node (CPU, memoria, rede, filesystem).
+      kubeletstats:
+        collection_interval: 30s
+        auth_type: serviceAccount
+        endpoint: "https://${env:K8S_NODE_IP}:10250"
+        # Certificado de serving do kubelet no EKS e autoassinado.
+        insecure_skip_verify: true
+        metric_groups:
+          - node
+          - pod
+          - container
+
+      # Estado do cluster (nodes, pods por fase, capacity/allocatable).
+      k8s_cluster:
+        auth_type: serviceAccount
+        k8s_leader_elector: k8s_leader_elector
+        collection_interval: 30s
+        node_conditions_to_report:
+          - Ready
+          - MemoryPressure
+          - DiskPressure
+          - PIDPressure
+          - NetworkUnavailable
+        allocatable_types_to_report:
+          - cpu
+          - memory
+          - ephemeral-storage
+
+      # Eventos do cluster (OOMKilled, FailedScheduling, Unhealthy, ...).
+      k8s_events:
+        auth_type: serviceAccount
+        k8s_leader_elector: k8s_leader_elector
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      # Enriquece com metadados de Kubernetes (namespace, deployment, ...).
+      # Sem passthrough: metricas que nao pertencem a um pod (node/cluster)
+      # apenas seguem sem enriquecimento, nao sao descartadas.
+      k8sattributes:
+        auth_type: serviceAccount
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.statefulset.name
+            - k8s.daemonset.name
+            - k8s.replicaset.name
+            - k8s.job.name
+            - k8s.cronjob.name
+            - k8s.node.name
+
+      resource/cluster:
+        attributes:
+          - key: k8s.cluster.name
+            value: mecanicadm-prod
+            action: upsert
+          - key: deployment.environment
+            value: prod
+            action: upsert
+
+      # OTLP/HTTP tem limite de payload de 1MB no New Relic: lotes contidos.
+      batch:
+        send_batch_size: 4096
+        send_batch_max_size: 8192
+        timeout: 15s
+
+    exporters:
+      otlphttp/newrelic:
+        endpoint: https://otlp.nr-data.net:4318
+        headers:
+          api-key: ${env:NEW_RELIC_LICENSE_KEY}
+        compression: gzip
+        timeout: 30s
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 1000
+
+    service:
+      extensions: [k8s_leader_elector]
+      telemetry:
+        logs:
+          level: info
+      pipelines:
+        metrics:
+          receivers: [kubeletstats, k8s_cluster]
+          processors: [memory_limiter, k8sattributes, resource/cluster, batch]
+          exporters: [otlphttp/newrelic]
+        logs:
+          receivers: [k8s_events]
+          processors: [memory_limiter, resource/cluster, batch]
+          exporters: [otlphttp/newrelic]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: mecanicadm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: collector
+        app.kubernetes.io/part-of: mecanicadm
+    spec:
+      serviceAccountName: otel-collector
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.165.0
+          args:
+            - --config=/conf/config.yaml
+          env:
+            # IP do node (status.hostIP) usado pelo receiver kubeletstats para
+            # falar com o kubelet local. Evita depender do DNS do node.
+            - name: K8S_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NEW_RELIC_LICENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: newrelic-license-key
+                  key: license-key
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config

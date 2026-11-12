@@ -1,0 +1,160 @@
+# Prometheus Agent v3.16.0
+# Fonte: https://github.com/prometheus/prometheus
+#
+# Faz o scrape do kube-state-metrics e envia as metricas para o New Relic via
+# remote_write (endpoint Prometheus da New Relic). Substitui a parte do antigo
+# nri-bundle que cuidava do kube-state-metrics + prometheus-agent.
+#
+# Roda em modo agent (--agent): nao guarda serie historica local, apenas WAL
+# para buffer e retry. Nao precisa de RBAC: o alvo e um Service interno.
+#
+# Autenticacao: a license key e lida do arquivo montado a partir do secret
+# "newrelic-license-key" (key: license-key) e enviada como Bearer token, que e
+# o esquema aceito pelo remote_write da New Relic (authorization.credentials).
+#
+# Conta EU ou JP? Troque a URL do remote_write para:
+#   EU: https://metric-api.eu.newrelic.com/prometheus/v1/write
+#   JP: https://metric-api.jp.nr-data.net/prometheus/v1/write
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: mecanicadm
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-agent-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: mecanicadm
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      external_labels:
+        cluster: mecanicadm-prod
+        environment: prod
+
+    scrape_configs:
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets:
+              - kube-state-metrics.observability.svc.cluster.local:8080
+        metric_relabel_configs:
+          # Secrets/configmaps e annotations nao interessam e geram cardinalidade.
+          - source_labels: [__name__]
+            regex: "kube_secret_.*|kube_configmap_.*|kube_.*_annotations"
+            action: drop
+
+    remote_write:
+      - url: https://metric-api.newrelic.com/prometheus/v1/write?prometheus_server=mecanicadm-prod
+        authorization:
+          credentials_file: /etc/newrelic/license-key
+        queue_config:
+          capacity: 2500
+          max_shards: 5
+          max_samples_per_send: 1000
+        write_relabel_configs:
+          - source_labels: [__name__]
+            regex: "kube_secret_.*|kube_configmap_.*|kube_.*_annotations"
+            action: drop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: mecanicadm
+spec:
+  replicas: 1
+  # Duas replicas enviariam series duplicadas no remote_write.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus-agent
+        app.kubernetes.io/component: metrics
+        app.kubernetes.io/part-of: mecanicadm
+    spec:
+      serviceAccountName: prometheus-agent
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus-agent
+          image: prom/prometheus:v3.16.0
+          args:
+            - --agent
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.agent.path=/prometheus
+            - --web.listen-address=:9090
+            - --log.level=info
+          ports:
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: newrelic-license-key
+              mountPath: /etc/newrelic
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-agent-config
+        - name: newrelic-license-key
+          secret:
+            secretName: newrelic-license-key
+            defaultMode: 0444
+        - name: data
+          emptyDir: {}

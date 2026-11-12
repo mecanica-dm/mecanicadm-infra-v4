@@ -1,0 +1,71 @@
+name: DNS - Hosted Zone Route 53
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'mecanicadm-v4-01' }}
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    environment: prod
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configura credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup do Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.4"
+
+      - name: Terraform Init
+        working-directory: dns
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_DEFAULT_REGION}" \
+            -backend-config="key=terraform/mecanicadm-dns/terraform.tfstate" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Format
+        working-directory: dns
+        run: terraform fmt -check -diff
+
+      - name: Terraform Validate
+        working-directory: dns
+        run: terraform validate -no-color
+
+      - name: Terraform Apply
+        working-directory: dns
+        run: terraform apply -auto-approve -input=false
+
+      - name: Nameservers para cadastrar no Registro.br
+        working-directory: dns
+        run: |
+          echo "========================================================="
+          echo " Cadastre os nameservers abaixo no painel.registro.br"
+          echo " (Domínios → mecanicadm.com.br → alterar servidores DNS)"
+          echo "========================================================="
+          terraform output -json name_servers | jq -r '.[]'

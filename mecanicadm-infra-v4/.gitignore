@@ -1,0 +1,14 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfplan-*
+crash.log
+crash.*.log
+
+# Kubernetes / local
+*.kubeconfig
+
+.idea/

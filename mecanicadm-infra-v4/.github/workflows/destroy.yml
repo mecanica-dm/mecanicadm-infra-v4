@@ -1,0 +1,111 @@
+name: DESTROY - Infraestrutura K8s (botão vermelho)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Digite DESTRUIR para confirmar"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Compartilhado com o ci-cd.yml: nunca apply e destroy ao mesmo tempo.
+  group: infra-prod
+  cancel-in-progress: false
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'mecanicadm-v4-01' }}
+  TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'terraform/mecanicadm-v4/terraform.tfstate' }}
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_cluster_name: ${{ vars.EKS_CLUSTER_NAME || 'mecanicadm-prod' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    environment: prod
+    timeout-minutes: 60
+
+    if: inputs.confirmation == 'DESTRUIR'
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configura credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup do Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.4"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_DEFAULT_REGION}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="use_lockfile=true"
+
+      - name: Verifica se o cluster EKS existe
+        id: cluster
+        run: |
+          if aws eks describe-cluster --name "$TF_VAR_cluster_name" --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Cluster já não existe; pulando a remoção dos add-ons."
+          fi
+
+      # Remove os add-ons antes do destroy para liberar os LoadBalancers (NLB do
+      # Kong). Sem isso o destroy termina e o NLB fica órfão na conta.
+      - name: Remove os add-ons (libera os LoadBalancers)
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          aws eks update-kubeconfig --name "$TF_VAR_cluster_name" --region "$AWS_DEFAULT_REGION"
+
+          kubectl delete -f k8s/addons/kong/kong.yaml --ignore-not-found --wait=true
+          kubectl delete -f k8s/addons/external-dns/external-dns.yaml --ignore-not-found --wait=true
+          kubectl delete -f k8s/addons/metrics-server/components.yaml --ignore-not-found --wait=true
+
+          # A stack de observabilidade pode estar desabilitada (observability_enabled=false).
+          if kubectl get namespace observability >/dev/null 2>&1; then
+            kubectl delete -f k8s/addons/observability/otel-collector.yaml --ignore-not-found --wait=true
+            kubectl delete -f k8s/addons/observability/prometheus-agent.yaml --ignore-not-found --wait=true
+            kubectl delete -f k8s/addons/observability/kube-state-metrics.yaml --ignore-not-found --wait=true
+            kubectl delete secret newrelic-license-key -n observability --ignore-not-found
+          fi
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve -input=false
+
+      # A deleção mais demorada é a do cluster (~10 min) e do NLB do Kong
+      # (que só some de verdade quando o load balancer é desprovisionado).
+      - name: Verifica órfãos (informativo)
+        if: always()
+        run: |
+          echo "=== Load Balancers restantes ==="
+          aws elbv2 describe-load-balancers \
+            --query 'LoadBalancers[].LoadBalancerName' \
+            --output table 2>/dev/null || true
+          echo "=== IPs Elásticos SEM anexo ==="
+          aws ec2 describe-addresses \
+            --query 'Addresses[?!AssociationId].PublicIp' \
+            --output table 2>/dev/null || true
+          echo "=== NAT Gateways ativos ==="
+          aws ec2 describe-nat-gateways \
+            --filters Name=state,Values=available,pending \
+            --query 'NatGateways[].NatGatewayId' \
+            --output table 2>/dev/null || true
+          echo ">>> Se aparecer algo acima, apague manualmente pelo console."
