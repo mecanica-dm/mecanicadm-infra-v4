@@ -43,7 +43,8 @@ observabilidade no New Relic) para a API **Mecânica DM** em produção.
 | VPC, subnets, NAT, EKS, node group | Terraform (`main.tf`) |
 | Namespaces `mecanicadm`, `kong`, `external-dns`, `observability` | Terraform |
 | ServiceAccounts com IRSA (ExternalDNS) | Terraform |
-| Parâmetros SSM `/mecanicadm/prod/vpc_id` e `/eks_node_sg_id` | Terraform |
+| Parâmetros SSM `/mecanicadm/prod/vpc_id`, `/eks_node_sg_id`, `/lambda_sg_id`, `/lambda_subnet_a` e `/lambda_subnet_b` | Terraform |
+| SG da Lambda validate-cpf (saída para o RDS) | Terraform (`main.tf`) |
 | Add-ons Kong, ExternalDNS, metrics-server | `kubectl apply` no `ci-cd.yml` |
 | Stack de observabilidade (kube-state-metrics, Prometheus Agent, OTel Collector) | `kubectl apply` no `ci-cd.yml` |
 | Secret `newrelic-license-key` (namespace `observability`) | `ci-cd.yml`, a partir do GitHub secret `NEW_RELIC_LICENSE_KEY` |

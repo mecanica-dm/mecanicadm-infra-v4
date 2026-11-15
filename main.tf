@@ -294,3 +294,42 @@ resource "aws_ssm_parameter" "eks_node_sg_id" {
   type  = "String"
   value = module.eks.node_security_group_id
 }
+
+# ---------------------------------------------------------------------------
+# Rede da Lambda validate-cpf (mecanicadm-lambda-v4). A Lambda roda nas
+# subnets privadas e o acesso ao RDS é liberado pelo mecanicadm-workorder-api-v4
+# a partir deste SG (parâmetro lambda_sg_id).
+# ---------------------------------------------------------------------------
+resource "aws_security_group" "lambda" {
+  name        = "mecanicadm-${var.environment}-lambda"
+  description = "Lambda validate-cpf (saida para o PostgreSQL)."
+  vpc_id      = module.vpc.vpc_id
+
+  egress {
+    description = "Saida liberada (a Lambda acessa o RDS dentro da VPC)."
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Environment = var.environment }
+}
+
+resource "aws_ssm_parameter" "lambda_sg_id" {
+  name  = "/mecanicadm/${var.environment}/lambda_sg_id"
+  type  = "String"
+  value = aws_security_group.lambda.id
+}
+
+resource "aws_ssm_parameter" "lambda_subnet_a" {
+  name  = "/mecanicadm/${var.environment}/lambda_subnet_a"
+  type  = "String"
+  value = module.vpc.private_subnets[0]
+}
+
+resource "aws_ssm_parameter" "lambda_subnet_b" {
+  name  = "/mecanicadm/${var.environment}/lambda_subnet_b"
+  type  = "String"
+  value = module.vpc.private_subnets[1]
+}
