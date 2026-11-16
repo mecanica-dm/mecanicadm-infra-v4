@@ -95,8 +95,6 @@ Não usamos mais **Helm** nem **External Secrets Operator** neste repositório.
    aplica os add-ons.
 3. **App**: o pipeline do repositório da app faz o deploy no namespace `mecanicadm`.
 
-Para o passo a passo manual, veja [INSTRUCOES_TERRAFORM_MANUAL.md](INSTRUCOES_TERRAFORM_MANUAL.md).
-
 ## Pipelines
 
 ### `ci-cd.yml`
@@ -107,12 +105,34 @@ Dispara em `push`/`pull_request` na `main` quando muda `*.tf`, `.terraform.lock.
 - `main`/manual: bootstrap do cluster (se necessário) → plan → apply → kubeconfig →
   add-ons → stack de observabilidade → rollout → verificação do IRSA do ExternalDNS.
 
+```mermaid
+flowchart LR
+    T([push / pull_request / manual]) --> E{Evento}
+    E -->|PR| I1[init] --> F1[fmt] --> V1[validate] --> P1[plan]
+    E -->|main / manual| B{Cluster existe?}
+    B -->|não| BS[bootstrap] --> P2
+    B -->|sim| P2[plan] --> A[apply] --> K[kubeconfig] --> AO[add-ons]
+    AO --> OB[stack de observabilidade] --> R[rollout] --> IR[verificação IRSA ExternalDNS]
+```
+
 ### `dns.yml`
 Manual. Executa o Terraform de `dns/` (state separado) e imprime os nameservers.
+
+```mermaid
+flowchart LR
+    T([workflow_dispatch]) --> I[init] --> P[plan] --> A[apply] --> NS[imprime nameservers]
+```
 
 ### `destroy.yml`
 Manual, exige digitar `DESTRUIR`. Remove os add-ons antes do destroy (para liberar o
 NLB do Kong), executa `terraform destroy` e lista recursos órfãos.
+
+```mermaid
+flowchart LR
+    T([workflow_dispatch]) --> C{Digitou DESTRUIR?}
+    C -->|não| X([abort])
+    C -->|sim| RA[remove add-ons] --> D[terraform destroy] --> O[lista recursos órfãos]
+```
 
 ## Add-ons
 
@@ -147,65 +167,9 @@ de **cluster** que antes vinha do `nri-bundle` (Helm) foi reconstruída sem Helm
 | Deployments, réplicas, HPA, Jobs, PVCs | `kube-state-metrics` | Prometheus `remote_write` |
 | Latência, erros, traces, JVM, slow queries | Java agent (repo da app) | APM |
 
-Pontos de atenção:
+## Repositórios relacionados
 
-- A license key **não** fica em nenhum manifest. A pipeline cria o secret
-  `newrelic-license-key` no namespace `observability` a partir do GitHub secret
-  `NEW_RELIC_LICENSE_KEY`; o collector e o Prometheus leem de lá
-  (`secretKeyRef` e `credentials_file`).
-- Endpoints usados são os da conta **US**. Para EU/JP, ajuste o endpoint do
-  `otel-collector` e a URL do `remote_write` (comentários no topo de cada manifest).
-- Para desligar a stack: `-var="observability_enabled=false"` (ou repo variable
-  equivalente). Sem a license key a pipeline também pula a stack, com `::warning::`.
-- Os nomes de cluster/ambiente enviados como labels são `mecanicadm-prod` e `prod`
-  (`resource/cluster` no collector e `external_labels` no Prometheus).
-
-Consultas úteis no New Relic (NRQL):
-
-```sql
--- CPU por pod no namespace da app
-FROM Metric SELECT average(k8s.pod.cpu.usage) FACET k8s.pod.name
-WHERE k8s.namespace.name = 'mecanicadm' TIMESERIES
-
--- Réplicas desejadas vs disponíveis por deployment
-FROM Metric SELECT latest(kube_deployment_spec_replicas), latest(kube_deployment_status_replicas_available)
-FACET deployment WHERE cluster = 'mecanicadm-prod'
-
--- Eventos recentes do cluster
-FROM Log SELECT * WHERE k8s.event.reason IS NOT NULL SINCE 1 hour ago
-```
-
-## Troubleshooting
-
-**Observabilidade sem dados no New Relic**
-```bash
-kubectl -n observability get pods
-kubectl -n observability logs ds/otel-collector --tail=100
-kubectl -n observability logs deploy/prometheus-agent --tail=100
-kubectl -n observability get lease otel-collector-cluster
-```
-- `401`/`403` nos logs → license key inválida/ausente; confira o secret
-  `newrelic-license-key` (a pipeline só o cria se `NEW_RELIC_LICENSE_KEY` existir).
-- `kubeletstats` com erro de conexão → o pod não alcança `https://<nodeIP>:10250`.
-- Lease sem líder → verifique se o pod do collector tem permissão em `leases`
-  (Role `otel-collector-lease`).
-
-**IRSA não injetado no ExternalDNS**
-```bash
-kubectl -n external-dns get pod -l app.kubernetes.io/name=external-dns \
-  -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}'
-```
-Se vier vazio, verifique o webhook de identidade (`eks-pod-identity-webhook`) do cluster.
-
-**Plan falha com "cluster not found"**
-O cluster não existe e o provider `kubernetes` não consegue ser configurado. Rode o
-workflow na `main` (bootstrap automático) ou manualmente:
-```bash
-terraform apply -target=module.eks -auto-approve
-```
-
-**NLB órfão após destroy**
-Rode o `destroy.yml` (ele remove o Kong antes) ou delete o manifest manualmente:
-```bash
-kubectl delete -f k8s/addons/kong/kong.yaml --ignore-not-found
-```
+- [mecanicadm-saga-api-v4](https://github.com/mecanica-dm/mecanicadm-saga-api-v4)
+- [mecanicadm-lambda-v4](https://github.com/mecanica-dm/mecanicadm-lambda-v4)
+- [mecanicadm-workorder-api-v4](https://github.com/mecanica-dm/mecanicadm-workorder-api-v4)
+- [mecanicadm-finance-api-v4](https://github.com/mecanica-dm/mecanicadm-finance-api-v4)
