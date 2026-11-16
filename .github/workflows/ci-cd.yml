@@ -106,8 +106,17 @@ jobs:
             exit 0
           fi
 
-          echo "Cluster não encontrado: criando VPC + EKS primeiro (target=module.eks)."
-          terraform apply -auto-approve -input=false -target=module.eks
+          # A VPC inteira (subnets públicas, IGW, NAT e route tables) precisa existir
+          # antes do node group: sem a NAT os nodes não alcançam a API da EC2 nem o EKS.
+          echo "Cluster não encontrado: criando VPC + EKS primeiro."
+          terraform apply -auto-approve -input=false -target=module.vpc -target=module.eks
+
+      # Garante a rede completa (NAT, IGW, route tables) antes de qualquer node
+      # group ser criado pelo apply principal, já que o -target acima pode não
+      # ter criado esses recursos em execuções anteriores.
+      - name: Garante a rede da VPC (NAT/IGW/route tables)
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve -input=false -target=module.vpc
 
       - name: Terraform Plan
         run: terraform plan -input=false -no-color -out=tfplan-prod
